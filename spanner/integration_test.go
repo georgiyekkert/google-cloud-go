@@ -282,6 +282,7 @@ func initIntegrationTests() (cleanup func()) {
 		}
 		configName = config.Name
 	}
+	log.Printf("Running test by using the instance config: %s\n", configName)
 
 	// First clean up any old test instances before we start the actual testing
 	// as these might cause this test run to fail.
@@ -3171,8 +3172,9 @@ func TestIntegration_StartBackupOperation(t *testing.T) {
 	skipEmulatorTest(t)
 	t.Parallel()
 
-	// Backups can be slow, so use a 30 minute timeout.
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	startTime := time.Now()
+	// Backups can be slow, so use 1 hour timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Hour)
 	defer cancel()
 	_, testDatabaseName, cleanup := prepareIntegrationTest(ctx, t, DefaultSessionPoolConfig, backuDBStatements)
 	defer cleanup()
@@ -3190,6 +3192,7 @@ func TestIntegration_StartBackupOperation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Logf("create backup operation took: %v\n", time.Since(startTime))
 	respMetadata, err := respLRO.Metadata()
 	if err != nil {
 		t.Fatalf("backup response metadata, got error %v, want nil", err)

@@ -741,6 +741,13 @@ func TestIntegration_ReadsAndQueries(t *testing.T) {
 		t.Errorf("Updating with DML affected %d rows, want 3", n)
 	}
 
+	rows := client.Single().Query(ctx, spanner.NewStatement("SELECT CAST('Foo' AS INT64)"))
+	_, err = rows.Next()
+	if g, w := spanner.ErrCode(err), codes.InvalidArgument; g != w {
+		t.Errorf("error code mismatch for invalid CAST\n Got: %v\nWant: %v", g, w)
+	}
+	rows.Stop()
+
 	// Do some complex queries.
 	tests := []struct {
 		q      string
@@ -748,9 +755,9 @@ func TestIntegration_ReadsAndQueries(t *testing.T) {
 		want   [][]interface{}
 	}{
 		{
-			`SELECT 17, "sweet", TRUE AND FALSE, NULL, B"hello", STARTS_WITH('Foo', 'B'), STARTS_WITH('Bar', 'B')`,
+			`SELECT 17, "sweet", TRUE AND FALSE, NULL, B"hello", STARTS_WITH('Foo', 'B'), STARTS_WITH('Bar', 'B'), CAST(17 AS STRING), SAFE_CAST(TRUE AS STRING), SAFE_CAST('Foo' AS INT64)`,
 			nil,
-			[][]interface{}{{int64(17), "sweet", false, nil, []byte("hello"), false, true}},
+			[][]interface{}{{int64(17), "sweet", false, nil, []byte("hello"), false, true, "17", "true", nil}},
 		},
 		// Check handling of NULL values for the IS operator.
 		// There was a bug that returned errors for some of these cases.
@@ -1305,8 +1312,8 @@ func TestIntegration_GeneratedColumns(t *testing.T) {
 
 	err = updateDDL(t, adminClient,
 		`ALTER TABLE `+tableName+` ADD COLUMN TotalSales2 INT64 AS (NumSongs * EstimatedSales) STORED`)
-	if err == nil {
-		t.Fatalf("Should have failed to add a generated column to non empty table")
+	if err != nil {
+		t.Fatalf("Failed to add a generated column to a non-empty table: %v", err)
 	}
 
 	ri := client.Single().Query(ctx, spanner.NewStatement(
@@ -1384,6 +1391,72 @@ func TestIntegration_GeneratedColumns(t *testing.T) {
 	}
 	if !reflect.DeepEqual(all, want) {
 		t.Errorf("Expected values are wrong.\n got %v\nwant %v", all, want)
+	}
+}
+
+func TestIntegration_Views(t *testing.T) {
+	_, adminClient, _, cleanup := makeClient(t)
+	defer cleanup()
+
+	err := updateDDL(t, adminClient, `CREATE VIEW SingersView SQL SECURITY INVOKER AS SELECT * FROM Singers`)
+	if err != nil {
+		t.Fatalf("Creating view: %v", err)
+	}
+	err = updateDDL(t, adminClient, `CREATE VIEW SingersView SQL SECURITY INVOKER AS SELECT * FROM Singers ORDER BY LastName`)
+	if g, w := spanner.ErrCode(err), codes.AlreadyExists; g != w {
+		t.Fatalf("Creating duplicate view error code mismatch\n  Got: %v\nWant: %v", g, w)
+	}
+	err = updateDDL(t, adminClient, `CREATE OR REPLACE VIEW SingersView SQL SECURITY INVOKER AS SELECT * FROM Singers ORDER BY LastName`)
+	if err != nil {
+		t.Fatalf("Replacing view: %v", err)
+	}
+	err = updateDDL(t, adminClient, `DROP VIEW SingersView`)
+	if err != nil {
+		t.Fatalf("Dropping view: %v", err)
+	}
+	err = updateDDL(t, adminClient, `DROP VIEW SingersView`)
+	if g, w := spanner.ErrCode(err), codes.NotFound; g != w {
+		t.Fatalf("Creating duplicate view error code mismatch\n  Got: %v\nWant: %v", g, w)
+	}
+}
+
+func TestIntegration_RowDeletionPolicy(t *testing.T) {
+	_, adminClient, _, cleanup := makeClient(t)
+	defer cleanup()
+
+	if err := updateDDL(t, adminClient,
+		`CREATE TABLE WithRowDeletionPolicy (
+			Id INT64,
+			Value STRING(MAX),
+			DelTimestamp TIMESTAMP,
+		) PRIMARY KEY (Id), ROW DELETION POLICY ( OLDER_THAN ( DelTimestamp, INTERVAL 30 DAY ))`,
+		`CREATE TABLE WithoutRowDeletionPolicy (
+			Id INT64,
+			Value STRING(MAX),
+			DelTimestamp TIMESTAMP,
+		) PRIMARY KEY (Id)`); err != nil {
+		t.Fatalf("Create tables: %v", err)
+	}
+	// These should succeed.
+	if err := updateDDL(t, adminClient, `ALTER TABLE WithRowDeletionPolicy REPLACE ROW DELETION POLICY ( OLDER_THAN ( DelTimestamp, INTERVAL 30 DAY ))`); err != nil {
+		t.Fatalf("Replacing row deletion policy: %v", err)
+	}
+	if err := updateDDL(t, adminClient, `ALTER TABLE WithRowDeletionPolicy DROP ROW DELETION POLICY`); err != nil {
+		t.Fatalf("Dropping row deletion policy: %v", err)
+	}
+	if err := updateDDL(t, adminClient, `ALTER TABLE WithRowDeletionPolicy ADD ROW DELETION POLICY ( OLDER_THAN ( DelTimestamp, INTERVAL 30 DAY ))`); err != nil {
+		t.Fatalf("Adding row deletion policy: %v", err)
+	}
+
+	// These should fail.
+	if err := updateDDL(t, adminClient, `ALTER TABLE WithoutRowDeletionPolicy REPLACE ROW DELETION POLICY ( OLDER_THAN ( DelTimestamp, INTERVAL 30 DAY ))`); err == nil {
+		t.Fatalf("Missing error for replacing row deletion policy")
+	}
+	if err := updateDDL(t, adminClient, `ALTER TABLE WithoutRowDeletionPolicy DROP ROW DELETION POLICY`); err == nil {
+		t.Fatalf("Missing error for dropping row deletion policy")
+	}
+	if err := updateDDL(t, adminClient, `ALTER TABLE WithRowDeletionPolicy ADD ROW DELETION POLICY ( OLDER_THAN ( DelTimestamp, INTERVAL 30 DAY ))`); err == nil {
+		t.Fatalf("Missing error for adding row deletion policy")
 	}
 }
 

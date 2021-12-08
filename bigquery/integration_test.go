@@ -41,6 +41,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	gax "github.com/googleapis/gax-go/v2"
+	"golang.org/x/xerrors"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
@@ -199,6 +200,9 @@ func initIntegrationTest() func() {
 			log.Fatalf("storage.NewClient: %v", err)
 		}
 		policyTagManagerClient, err = datacatalog.NewPolicyTagManagerClient(ctx, ptmOpts...)
+		if err != nil {
+			log.Fatalf("datacatalog.NewPolicyTagManagerClient: %v", err)
+		}
 		c := initTestState(client, now)
 		return func() { c(); cleanup() }
 	}
@@ -244,6 +248,70 @@ func TestIntegration_DetectProjectID(t *testing.T) {
 	if badClient, err := NewClient(ctx, DetectProjectID, option.WithTokenSource(badTS)); err == nil {
 		t.Errorf("expected error from bad token source, NewClient succeeded with project: %s", badClient.Project())
 	}
+}
+
+func TestIntegration_JobFrom(t *testing.T) {
+	if client == nil {
+		t.Skip("Integration tests skipped")
+	}
+	ctx := context.Background()
+
+	// Create a job we can use for referencing.
+	q := client.Query("SELECT 123 as foo")
+	it, err := q.Read(ctx)
+	if err != nil {
+		t.Fatalf("failed to run test query: %v", err)
+	}
+	want := it.SourceJob()
+
+	// establish a new client that's pointed at an invalid project/location.
+	otherClient, err := NewClient(ctx, "bad-project-id")
+	if err != nil {
+		t.Fatalf("failed to create other client: %v", err)
+	}
+	otherClient.Location = "badloc"
+
+	for _, tc := range []struct {
+		description string
+		f           func(*Client) (*Job, error)
+		wantErr     bool
+	}{
+		{
+			description: "JobFromID",
+			f:           func(c *Client) (*Job, error) { return c.JobFromID(ctx, want.jobID) },
+			wantErr:     true,
+		},
+		{
+			description: "JobFromIDLocation",
+			f:           func(c *Client) (*Job, error) { return c.JobFromIDLocation(ctx, want.jobID, want.location) },
+			wantErr:     true,
+		},
+		{
+			description: "JobFromProject",
+			f:           func(c *Client) (*Job, error) { return c.JobFromProject(ctx, want.projectID, want.jobID, want.location) },
+		},
+	} {
+		got, err := tc.f(otherClient)
+		if err != nil {
+			if !tc.wantErr {
+				t.Errorf("case %q errored: %v", tc.description, err)
+			}
+			continue
+		}
+		if tc.wantErr {
+			t.Errorf("case %q got success, expected error", tc.description)
+		}
+		if got.projectID != want.projectID {
+			t.Errorf("case %q projectID mismatch, got %s want %s", tc.description, got.projectID, want.projectID)
+		}
+		if got.location != want.location {
+			t.Errorf("case %q location mismatch, got %s want %s", tc.description, got.location, want.location)
+		}
+		if got.jobID != want.jobID {
+			t.Errorf("case %q jobID mismatch, got %s want %s", tc.description, got.jobID, want.jobID)
+		}
+	}
+
 }
 
 func TestIntegration_TableCreate(t *testing.T) {
@@ -303,12 +371,12 @@ func TestIntegration_TableCreateView(t *testing.T) {
 	}
 	ctx := context.Background()
 	table := newTable(t, schema)
+	tableIdentifier, _ := table.Identifier(StandardSQLID)
 	defer table.Delete(ctx)
 
 	// Test that standard SQL views work.
 	view := dataset.Table("t_view_standardsql")
-	query := fmt.Sprintf("SELECT APPROX_COUNT_DISTINCT(name) FROM `%s.%s.%s`",
-		dataset.ProjectID, dataset.DatasetID, table.TableID)
+	query := fmt.Sprintf("SELECT APPROX_COUNT_DISTINCT(name) FROM %s", tableIdentifier)
 	err := view.Create(context.Background(), &TableMetadata{
 		ViewQuery:      query,
 		UseStandardSQL: true,
@@ -868,10 +936,11 @@ func TestIntegration_DatasetUpdateAccess(t *testing.T) {
 	// Create a sample UDF so we can verify adding authorized UDFs
 	routineID := routineIDs.New()
 	routine := dataset.Routine(routineID)
+	routineSQLID, _ := routine.Identifier(StandardSQLID)
 
 	sql := fmt.Sprintf(`
-			CREATE FUNCTION `+"`%s`"+`(x INT64) AS (x * 3);`,
-		routine.FullyQualifiedName())
+			CREATE FUNCTION %s(x INT64) AS (x * 3);`,
+		routineSQLID)
 	if _, _, err := runQuerySQL(ctx, sql); err != nil {
 		t.Fatal(err)
 	}
@@ -1280,13 +1349,14 @@ func TestIntegration_RoutineStoredProcedure(t *testing.T) {
 	// Define a simple stored procedure via DDL.
 	routineID := routineIDs.New()
 	routine := dataset.Routine(routineID)
+	routineSQLID, _ := routine.Identifier(StandardSQLID)
 	sql := fmt.Sprintf(`
-		CREATE OR REPLACE PROCEDURE `+"`%s`"+`(val INT64)
+		CREATE OR REPLACE PROCEDURE %s(val INT64)
 		BEGIN
 			SELECT CURRENT_TIMESTAMP() as ts;
 			SELECT val * 2 as f2;
 		END`,
-		routine.FullyQualifiedName())
+		routineSQLID)
 
 	if _, _, err := runQuerySQL(ctx, sql); err != nil {
 		t.Fatal(err)
@@ -1295,8 +1365,8 @@ func TestIntegration_RoutineStoredProcedure(t *testing.T) {
 
 	// Invoke the stored procedure.
 	sql = fmt.Sprintf(`
-	CALL `+"`%s`"+`(5)`,
-		routine.FullyQualifiedName())
+	CALL %s(5)`,
+		routineSQLID)
 
 	q := client.Query(sql)
 	it, err := q.Read(ctx)
@@ -1374,14 +1444,15 @@ func TestIntegration_InsertErrors(t *testing.T) {
 	if err == nil {
 		t.Errorf("Wanted row size error, got successful insert.")
 	}
-	e, ok := err.(*googleapi.Error)
+	var e1 *googleapi.Error
+	ok := xerrors.As(err, &e1)
 	if !ok {
 		t.Errorf("Wanted googleapi.Error, got: %v", err)
 	}
-	if e.Code != http.StatusRequestEntityTooLarge {
+	if e1.Code != http.StatusRequestEntityTooLarge {
 		want := "Request payload size exceeds the limit"
-		if !strings.Contains(e.Message, want) {
-			t.Errorf("Error didn't contain expected message (%s): %#v", want, e)
+		if !strings.Contains(e1.Message, want) {
+			t.Errorf("Error didn't contain expected message (%s): %#v", want, e1)
 		}
 	}
 	// Case 2: Very Large Request
@@ -1393,12 +1464,13 @@ func TestIntegration_InsertErrors(t *testing.T) {
 	if err == nil {
 		t.Errorf("Wanted error, got successful insert.")
 	}
-	e, ok = err.(*googleapi.Error)
+	var e2 *googleapi.Error
+	ok = xerrors.As(err, &e2)
 	if !ok {
 		t.Errorf("wanted googleapi.Error, got: %v", err)
 	}
-	if e.Code != http.StatusBadRequest && e.Code != http.StatusRequestEntityTooLarge {
-		t.Errorf("Wanted HTTP 400 or 413, got %d", e.Code)
+	if e2.Code != http.StatusBadRequest && e2.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("Wanted HTTP 400 or 413, got %d", e2.Code)
 	}
 }
 
@@ -1945,10 +2017,21 @@ func TestIntegration_QueryStatistics(t *testing.T) {
 	if len(qStats.Timeline) == 0 {
 		t.Error("expected query timeline, none present")
 	}
+
+	if qStats.BIEngineStatistics != nil {
+		expectedMode := false
+		for _, m := range []string{"FULL", "PARTIAL", "DISABLED"} {
+			if qStats.BIEngineStatistics.BIEngineMode == m {
+				expectedMode = true
+			}
+		}
+		if !expectedMode {
+			t.Errorf("unexpected BIEngineMode for BI Engine statistics, got %s", qStats.BIEngineStatistics.BIEngineMode)
+		}
+	}
 }
 
 func TestIntegration_Load(t *testing.T) {
-	t.Skip("https://github.com/googleapis/google-cloud-go/issues/4418")
 	if client == nil {
 		t.Skip("Integration tests skipped")
 	}
@@ -2045,18 +2128,19 @@ func runQuerySQL(ctx context.Context, sql string) (*JobStatistics, *QueryStatist
 func runQueryJob(ctx context.Context, q *Query) (*JobStatistics, *QueryStatistics, error) {
 	var jobStats *JobStatistics
 	var queryStats *QueryStatistics
-	var err error
-	err = internal.Retry(ctx, gax.Backoff{}, func() (stop bool, err error) {
+	var err = internal.Retry(ctx, gax.Backoff{}, func() (stop bool, err error) {
 		job, err := q.Run(ctx)
 		if err != nil {
-			if e, ok := err.(*googleapi.Error); ok && e.Code < 500 {
+			var e *googleapi.Error
+			if ok := xerrors.As(err, &e); ok && e.Code < 500 {
 				return true, err // fail on 4xx
 			}
 			return false, err
 		}
 		_, err = job.Wait(ctx)
 		if err != nil {
-			if e, ok := err.(*googleapi.Error); ok && e.Code < 500 {
+			var e *googleapi.Error
+			if ok := xerrors.As(err, &e); ok && e.Code < 500 {
 				return true, err // fail on 4xx
 			}
 			return false, err
@@ -2272,8 +2356,10 @@ func TestIntegration_QueryExternalHivePartitioning(t *testing.T) {
 	}
 	defer customTable.Delete(ctx)
 
+	customTableSQLID, _ := customTable.Identifier(StandardSQLID)
+
 	// Issue a test query that prunes based on the custom hive partitioning key, and verify the result is as expected.
-	sql := fmt.Sprintf("SELECT COUNT(*) as ct FROM `%s`.%s.%s WHERE pkey=\"foo\"", customTable.ProjectID, customTable.DatasetID, customTable.TableID)
+	sql := fmt.Sprintf("SELECT COUNT(*) as ct FROM %s WHERE pkey=\"foo\"", customTableSQLID)
 	q := client.Query(sql)
 	it, err := q.Read(ctx)
 	if err != nil {
@@ -3145,10 +3231,10 @@ func TestIntegration_ModelLifecycle(t *testing.T) {
 	// Create a model via a CREATE MODEL query
 	modelID := modelIDs.New()
 	model := dataset.Model(modelID)
-	modelRef := fmt.Sprintf("%s.%s.%s", dataset.ProjectID, dataset.DatasetID, modelID)
+	modelSQLID, _ := model.Identifier(StandardSQLID)
 
 	sql := fmt.Sprintf(`
-		CREATE MODEL `+"`%s`"+`
+		CREATE MODEL %s
 		OPTIONS (
 			model_type='linear_reg',
 			max_iteration=1,
@@ -3158,7 +3244,7 @@ func TestIntegration_ModelLifecycle(t *testing.T) {
 			SELECT 'a' AS f1, 2.0 AS label
 			UNION ALL
 			SELECT 'b' AS f1, 3.8 AS label
-		)`, modelRef)
+		)`, modelSQLID)
 	if _, _, err := runQuerySQL(ctx, sql); err != nil {
 		t.Fatal(err)
 	}
@@ -3335,13 +3421,14 @@ func TestIntegration_RoutineComplexTypes(t *testing.T) {
 
 	routineID := routineIDs.New()
 	routine := dataset.Routine(routineID)
+	routineSQLID, _ := routine.Identifier(StandardSQLID)
 	sql := fmt.Sprintf(`
-		CREATE FUNCTION `+"`%s`("+`
+		CREATE FUNCTION %s(
 			arr ARRAY<STRUCT<name STRING, val INT64>>
 		  ) AS (
 			  (SELECT SUM(IF(elem.name = "foo",elem.val,null)) FROM UNNEST(arr) AS elem)
 		  )`,
-		routine.FullyQualifiedName())
+		routineSQLID)
 	if _, _, err := runQuerySQL(ctx, sql); err != nil {
 		t.Fatal(err)
 	}
@@ -3398,10 +3485,11 @@ func TestIntegration_RoutineLifecycle(t *testing.T) {
 	// Create a scalar UDF routine via a CREATE FUNCTION query
 	routineID := routineIDs.New()
 	routine := dataset.Routine(routineID)
+	routineSQLID, _ := routine.Identifier(StandardSQLID)
 
 	sql := fmt.Sprintf(`
-		CREATE FUNCTION `+"`%s`"+`(x INT64) AS (x * 3);`,
-		routine.FullyQualifiedName())
+		CREATE FUNCTION %s(x INT64) AS (x * 3);`,
+		routineSQLID)
 	if _, _, err := runQuerySQL(ctx, sql); err != nil {
 		t.Fatal(err)
 	}
@@ -3553,7 +3641,8 @@ func (b byCol0) Less(i, j int) bool {
 }
 
 func hasStatusCode(err error, code int) bool {
-	if e, ok := err.(*googleapi.Error); ok && e.Code == code {
+	var e *googleapi.Error
+	if ok := xerrors.As(err, &e); ok && e.Code == code {
 		return true
 	}
 	return false
